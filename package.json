@@ -1,0 +1,12 @@
+{
+  "name": "muse-shelf",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Private repository shelf and agent inbox using Vercel Blob",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.2"
+  }
+}
