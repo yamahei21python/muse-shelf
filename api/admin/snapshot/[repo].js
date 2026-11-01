@@ -1,7 +1,7 @@
 import { authenticateAdmin } from '../../../lib/auth.js';
 import { parseBody, sendJson, sendError, HttpError } from '../../../lib/http.js';
 import { putBuffer } from '../../../lib/store.js';
-import { isValidRepo, MAX_BODY_SIZE } from '../../../lib/validation.js';
+import { isValidRepo, isValidSha, MAX_BODY_SIZE } from '../../../lib/validation.js';
 
 export const config = {
   api: {
@@ -35,6 +35,9 @@ export default async function handler(req, res) {
   if (!sha || typeof sha !== 'string' || !sha.trim()) {
     return sendError(res, 400, 'Missing x-sha header');
   }
+  if (!isValidSha(sha.trim())) {
+    return sendError(res, 400, 'Invalid x-sha header');
+  }
 
   let bodyBuffer;
   try {
@@ -44,6 +47,11 @@ export default async function handler(req, res) {
       return sendError(res, err.statusCode, err.message);
     }
     return sendError(res, 500, 'Internal server error reading body');
+  }
+
+  // Item 9: Check gzip magic bytes 0x1f 0x8b
+  if (bodyBuffer.length < 2 || bodyBuffer[0] !== 0x1f || bodyBuffer[1] !== 0x8b) {
+    return sendError(res, 400, 'Body is not gzip');
   }
 
   try {

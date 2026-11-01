@@ -13,7 +13,7 @@ test('Inbox POST: appends entry, increments seq, and stores blob', async () => {
         method: 'POST',
         headers: {
           'content-type': 'application/gzip',
-          'x-base-sha': 'base-sha-12345',
+          'x-base-sha': '0123456789abcdef0123456789abcdef01234567',
         },
         body: payload1,
       }
@@ -31,7 +31,7 @@ test('Inbox POST: appends entry, increments seq, and stores blob', async () => {
         method: 'POST',
         headers: {
           'content-type': 'application/gzip',
-          'x-base-sha': 'base-sha-67890',
+          'x-base-sha': 'fedcba9876543210fedcba9876543210fedcba98',
           'x-from': 'custom-agent',
         },
         body: payload2,
@@ -53,18 +53,22 @@ test('Inbox POST: appends entry, increments seq, and stores blob', async () => {
     assert.strictEqual(index.entries[0].seq, 1);
     assert.strictEqual(index.entries[0].from, 'macmuse');
     assert.strictEqual(index.entries[0].repo, 'my-repo');
-    assert.strictEqual(index.entries[0].base_sha, 'base-sha-12345');
+    assert.strictEqual(index.entries[0].base_sha, '0123456789abcdef0123456789abcdef01234567');
     assert.strictEqual(index.entries[0].size_bytes, payload1.length);
     assert.strictEqual(index.entries[0].path.startsWith('inbox/macmuse/'), true);
-    assert.strictEqual(index.entries[0].path.endsWith('-my-repo.tar.gz'), true);
+    // Item 1: path carries a random suffix: <ts>-my-repo-<rand8>.tar.gz
+    assert.match(index.entries[0].path, /^inbox\/macmuse\/\d{8}-\d{6}-my-repo-[0-9a-f]{8}\.tar\.gz$/);
     assert.ok(index.entries[0].received_at);
 
-    // Check entry 2 custom from = 'custom-agent'
+    // Item 4: from is pinned to the token identity; x-from is only recorded as from_claimed
     assert.strictEqual(index.entries[1].seq, 2);
-    assert.strictEqual(index.entries[1].from, 'custom-agent');
+    assert.strictEqual(index.entries[1].from, 'macmuse');
+    assert.strictEqual(index.entries[1].from_claimed, 'custom-agent');
     assert.strictEqual(index.entries[1].repo, 'my-repo');
-    assert.strictEqual(index.entries[1].base_sha, 'base-sha-67890');
-    assert.strictEqual(index.entries[1].path.startsWith('inbox/custom-agent/'), true);
+    assert.strictEqual(index.entries[1].base_sha, 'fedcba9876543210fedcba9876543210fedcba98');
+    assert.strictEqual(index.entries[1].path.startsWith('inbox/macmuse/'), true);
+    // Item 1: the two uploads never share a path
+    assert.notStrictEqual(index.entries[0].path, index.entries[1].path);
 
     // Check that stored blob bytes match
     const storedBlob1 = await env.memoryStore.getBuffer(index.entries[0].path);
@@ -106,7 +110,7 @@ test('Inbox POST: rejects bad repo name with 400', async () => {
         method: 'POST',
         headers: {
           'content-type': 'application/gzip',
-          'x-base-sha': 'sha123',
+          'x-base-sha': 'abc1234',
         },
         body: payload,
       }
@@ -129,7 +133,7 @@ test('Inbox POST: rejects oversize body (> 4.5 MB) with 413', async () => {
         method: 'POST',
         headers: {
           'content-type': 'application/gzip',
-          'x-base-sha': 'sha123',
+          'x-base-sha': 'abc1234',
           'content-length': String(oversizePayload.length),
         },
         body: oversizePayload,

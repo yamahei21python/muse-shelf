@@ -1,5 +1,6 @@
 import { authenticateAdmin, mintToken } from '../../lib/auth.js';
 import { parseJsonBody, sendJson, sendError, HttpError } from '../../lib/http.js';
+import { sanitizeFrom } from '../../lib/validation.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -29,6 +30,11 @@ export default async function handler(req, res) {
 
   if (typeof label !== 'string' || !label.trim()) {
     return sendError(res, 400, 'Invalid label');
+  }
+
+  // Item 8: Require sanitizeFrom(label) !== null
+  if (sanitizeFrom(label.trim()) === null) {
+    return sendError(res, 400, 'Invalid label for inbox posting');
   }
 
   if (!process.env.SHELF_SIGNING_SECRET) {

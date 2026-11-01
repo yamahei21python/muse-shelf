@@ -84,13 +84,13 @@ All state is stored within private Vercel Blob keys:
     ]
   }
   ```
-- `inbox/<from>/<yyyymmdd-hhmmss>-<repo>.tar.gz` — Individual submitted work products.
+- `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz` — Individual submitted work products (with a random 8-character hex suffix to ensure unique paths even for concurrent uploads within the same second).
 
 ### Identifiers & Limits
 - `<repo>`: Must match `^[a-z0-9][a-z0-9._-]*$` (strictly lowercase). Non-matching identifiers are rejected with `400`.
 - `<from>`: Sanitised by converting to lowercase, replacing characters outside `[a-z0-9._-]` with `-`, and trimming non-alphanumeric prefixes.
 - **Payload size limit**: Upload bodies for snapshots and inbox items are capped at 4.5 MB (`4,718,592` bytes). Requests exceeding this limit receive HTTP `413 Payload Too Large`.
-- **Errors**: All errors are returned as JSON `{"error": "..."}` with appropriate HTTP status codes (400, 401, 404, 405, 413, 500).
+- **Errors**: Application errors are returned as JSON `{"error": "..."}` with appropriate HTTP status codes (400, 401, 404, 405, 413, 500). Rejections issued by the hosting platform itself (for example Vercel's own request-body limit) may not be JSON.
 
 ---
 
@@ -113,9 +113,9 @@ All state is stored within private Vercel Blob keys:
   - Authenticated via URL path `<token>`.
   - Headers:
     - `x-base-sha` (required): Commit SHA the agent's work is based upon.
-    - `x-from` (optional): Display name override (defaults to recipient token name or signed token label).
+    - `x-from` (optional): Self-declared sender name, recorded in the index entry as `from_claimed` for information only. The stored `from` and the blob path always use the authenticated token identity (recipient token name or signed token label), never this header.
   - Body: Raw `tar.gz` archive (max 4.5 MB).
-  - Saves file to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>.tar.gz`, appends entry to `inbox/index.json`, increments `seq`.
+  - Saves file to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz`, appends entry to `inbox/index.json`, increments `seq`.
   - Returns `201 {"ok":true,"seq":N}`.
 
 ### Admin Routes (`x-admin-token` header)
@@ -143,22 +143,22 @@ All state is stored within private Vercel Blob keys:
 
 ### Explanation
 When an agent submits work to `POST /api/s/<token>/inbox/<repo>`, the server:
-1. Uploads the blob to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>.tar.gz`.
-2. Reads `inbox/index.json` from Vercel Blob store.
+1. Uploads the blob to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz`.
+2. Reads `inbox/index.json` (with its ETag) from Vercel Blob store.
 3. Increments `index.seq` and appends the new entry record to `index.entries`.
-4. Overwrites `inbox/index.json` with the updated JSON.
-
-Vercel Blob is an object storage system, not a relational database. It lacks built-in transactional primitives, distributed mutex locks, or conditional updates in this access pattern. If two agents simultaneously submit work:
-- Both requests may read the same initial state of `inbox/index.json` (e.g. `seq = 5`).
-- Both calculate `seq = 6`.
-- Both write back their respective `inbox/index.json`.
-- The last write wins, silently overwriting the other's entry in the index list and duplicating sequence numbers.
+4. Writes `inbox/index.json` back conditionally with `ifMatch` set to the ETag it read. If the precondition fails (a concurrent submit won the race), it re-reads and retries, up to 3 attempts, before returning `500`.
 
 ### Operational Scope & Mitigations
-In `muse-shelf`, this design tradeoff is intentional:
-- Distribution is meant for a small set of trusted, asynchronous AI agents submitting infrequent completed tasks, where submission collision probability is near zero.
-- The underlying blob files (`inbox/<from>/<yyyymmdd-hhmmss>-<repo>.tar.gz`) are always preserved and never overwritten because their paths contain timestamp and agent name.
-- If high-concurrency atomic inbox indexing is required in the future, the index state can be backed by a transactional store (such as Vercel Postgres or Redis) or optimistic concurrency control via blob ETags (`if-match` conditional PUT).
+- Blob paths are unique per upload: the file name carries a random 8-hex-character suffix, so two submissions in the same second — even from the same agent for the same repo — never overwrite each other, and every index entry points at its own bytes.
+- The index append uses optimistic concurrency (ETag + `ifMatch` + bounded retry), so concurrent submissions no longer silently drop each other's entries in the common case. A submission that still collides after all retries fails loudly with `500` instead of losing data silently.
+- Distribution is meant for a small set of trusted, asynchronous AI agents submitting infrequent completed tasks, so contention is rare to begin with.
+
+---
+
+## Security Notes
+
+- **Tokens live in URL paths by design** (capability URLs). They therefore appear in web-server and proxy access logs. Long-lived tokens are long random values; rotate them periodically and treat log access as token access.
+- **Inbox tarballs are untrusted input.** A return's contents were produced by another agent and only format-checked (gzip magic bytes, declared SHA format) on upload. Whoever extracts a return must validate archive entry paths (no absolute paths, no `..` segments) before writing anything to disk, and must review the contents before use — the operator verifies every return before it is applied anywhere.
 
 ---
 

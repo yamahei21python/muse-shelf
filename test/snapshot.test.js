@@ -11,7 +11,7 @@ test('Snapshot PUT: stores snapshot bytes and writes meta JSON', async () => {
       method: 'PUT',
       headers: {
         'x-admin-token': TEST_ADMIN_TOKEN,
-        'x-sha': 'commit-sha-abc-123',
+        'x-sha': '0123456789abcdef0123456789abcdef01234567',
         'content-type': 'application/gzip',
       },
       body: snapshotBytes,
@@ -22,7 +22,7 @@ test('Snapshot PUT: stores snapshot bytes and writes meta JSON', async () => {
     assert.deepStrictEqual(data, {
       ok: true,
       repo: 'project-a',
-      sha: 'commit-sha-abc-123',
+      sha: '0123456789abcdef0123456789abcdef01234567',
       size_bytes: snapshotBytes.length,
     });
 
@@ -35,7 +35,7 @@ test('Snapshot PUT: stores snapshot bytes and writes meta JSON', async () => {
     assert.ok(storedMetaBuf);
     const meta = JSON.parse(storedMetaBuf.toString('utf8'));
     assert.strictEqual(meta.repo, 'project-a');
-    assert.strictEqual(meta.sha, 'commit-sha-abc-123');
+    assert.strictEqual(meta.sha, '0123456789abcdef0123456789abcdef01234567');
     assert.strictEqual(meta.size_bytes, snapshotBytes.length);
     assert.ok(meta.updated_at);
     assert.strictEqual(new Date(meta.updated_at).toISOString(), meta.updated_at);
@@ -73,7 +73,7 @@ test('Snapshot PUT: rejects invalid repo name with 400', async () => {
       method: 'PUT',
       headers: {
         'x-admin-token': TEST_ADMIN_TOKEN,
-        'x-sha': 'sha123',
+        'x-sha': 'abc1234',
       },
       body: snapshotBytes,
     });
@@ -94,7 +94,7 @@ test('Snapshot PUT: rejects oversize body with 413', async () => {
       method: 'PUT',
       headers: {
         'x-admin-token': TEST_ADMIN_TOKEN,
-        'x-sha': 'sha123',
+        'x-sha': 'abc1234',
         'content-length': String(oversizePayload.length),
       },
       body: oversizePayload,
@@ -114,7 +114,7 @@ test('Snapshot PUT: rejects unauthenticated call with 401', async () => {
     const res = await fetch(`${env.baseUrl}/api/admin/snapshot/project-a`, {
       method: 'PUT',
       headers: {
-        'x-sha': 'sha123',
+        'x-sha': 'abc1234',
       },
       body: 'foo',
     });

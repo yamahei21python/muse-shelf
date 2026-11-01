@@ -1,0 +1,192 @@
+/**
+ * Regression tests for the review-fix round (FIX_SPEC items 1-10).
+ * Items 1 and 4 are covered by the updated happy-path test in
+ * inbox.test.js; this file covers items 2, 3, 5, 6, 8, 9, 10.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import {
+  setupTestServer,
+  TEST_ADMIN_TOKEN,
+  TEST_RECIPIENT_TOKENS,
+  createGzipBuffer,
+} from './helpers.js';
+import { createMemoryAdapter } from '../lib/store.js';
+import { MAX_BODY_SIZE } from '../lib/validation.js';
+
+const HEX_SHA = '0123456789abcdef0123456789abcdef01234567';
+const MAC = TEST_RECIPIENT_TOKENS.macmuse;
+
+// Item 2: optimistic concurrency in the memory adapter
+test('Fix item 2: adapter getEntry/ifMatch precondition', async () => {
+  const adapter = createMemoryAdapter();
+  await adapter.putBuffer('inbox/index.json', Buffer.from('{"seq":0}'), 'application/json');
+  const entry = await adapter.getEntry('inbox/index.json');
+  assert.ok(entry);
+  assert.strictEqual(entry.buffer.toString('utf8'), '{"seq":0}');
+
+  // Stale etag -> PreconditionFailed
+  await assert.rejects(
+    adapter.putBuffer('inbox/index.json', Buffer.from('{"seq":1}'), 'application/json', { ifMatch: 'stale-etag' }),
+    (err) => err.name.includes('PreconditionFailed')
+  );
+
+  // Fresh etag -> succeeds and rotates the etag
+  const res = await adapter.putBuffer('inbox/index.json', Buffer.from('{"seq":1}'), 'application/json', { ifMatch: entry.etag });
+  assert.ok(res.etag);
+  assert.notStrictEqual(res.etag, entry.etag);
+  const after = await adapter.getEntry('inbox/index.json');
+  assert.strictEqual(after.buffer.toString('utf8'), '{"seq":1}');
+});
+
+// Item 3: repo names containing ".." as a substring stay retrievable
+test('Fix item 3: inbox-file allows a..b, rejects traversal shapes', async () => {
+  const payload = createGzipBuffer('dotdot repo work');
+  const goodPath = 'inbox/agent-x/20260101-000000-a..b.tar.gz';
+  const env = await setupTestServer({ [goodPath]: payload });
+  try {
+    const ok = await fetch(
+      `${env.baseUrl}/api/admin/inbox-file?path=${encodeURIComponent(goodPath)}`,
+      { headers: { 'x-admin-token': TEST_ADMIN_TOKEN } }
+    );
+    assert.strictEqual(ok.status, 200);
+    assert.deepStrictEqual(Buffer.from(await ok.arrayBuffer()), payload);
+
+    for (const bad of ['inbox/../secret.tar.gz', 'inbox/a/../../b.tar.gz', 'inbox/a/b/c.tar.gz', 'inbox/a/..\\b.tar.gz']) {
+      const res = await fetch(
+        `${env.baseUrl}/api/admin/inbox-file?path=${encodeURIComponent(bad)}`,
+        { headers: { 'x-admin-token': TEST_ADMIN_TOKEN } }
+      );
+      assert.strictEqual(res.status, 400, `expected 400 for ${bad}`);
+    }
+  } finally {
+    await env.close();
+  }
+});
+
+// Item 5: chunked oversize upload receives a real 413 response
+test('Fix item 5: chunked oversize inbox POST returns 413 JSON, not a reset', async () => {
+  const env = await setupTestServer();
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const req = http.request(
+        `${env.baseUrl}/api/s/${MAC}/inbox/my-repo`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/gzip',
+            'x-base-sha': HEX_SHA,
+            'transfer-encoding': 'chunked',
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+        }
+      );
+      req.on('error', reject);
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      let sent = 0;
+      const total = MAX_BODY_SIZE + 256 * 1024;
+      (function pump() {
+        while (sent < total) {
+          sent += chunk.length;
+          if (!req.write(chunk)) {
+            req.once('drain', pump);
+            return;
+          }
+        }
+        req.end();
+      })();
+    });
+    assert.strictEqual(result.status, 413);
+    assert.match(result.body, /"error"/);
+  } finally {
+    await env.close();
+  }
+});
+
+// Item 6 (+7): malformed percent-encoding is a 400 through the router catch
+test('Fix item 6/7: malformed percent-encoding returns 400 JSON', async () => {
+  const env = await setupTestServer();
+  try {
+    const res = await fetch(`${env.baseUrl}/api/s/%E0%A4%A/manifest`);
+    assert.strictEqual(res.status, 400);
+    const data = await res.json();
+    assert.ok(data.error);
+  } finally {
+    await env.close();
+  }
+});
+
+// Item 8: mint rejects labels that sanitizeFrom reduces to null
+test('Fix item 8: mint rejects a Japanese-only label', async () => {
+  const env = await setupTestServer();
+  try {
+    const res = await fetch(`${env.baseUrl}/api/admin/mint`, {
+      method: 'POST',
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN, 'content-type': 'application/json' },
+      body: JSON.stringify({ ttl_minutes: 30, label: 'テスト専用' }),
+    });
+    assert.strictEqual(res.status, 400);
+  } finally {
+    await env.close();
+  }
+});
+
+// Item 9: sha format and gzip magic are enforced on both write endpoints
+test('Fix item 9: invalid sha and non-gzip bodies are rejected', async () => {
+  const env = await setupTestServer();
+  try {
+    const badShaInbox = await fetch(`${env.baseUrl}/api/s/${MAC}/inbox/my-repo`, {
+      method: 'POST',
+      headers: { 'x-base-sha': 'not-a-sha!' },
+      body: createGzipBuffer('work'),
+    });
+    assert.strictEqual(badShaInbox.status, 400);
+
+    const plainInbox = await fetch(`${env.baseUrl}/api/s/${MAC}/inbox/my-repo`, {
+      method: 'POST',
+      headers: { 'x-base-sha': HEX_SHA },
+      body: Buffer.from('this is not gzip'),
+    });
+    assert.strictEqual(plainInbox.status, 400);
+
+    const badShaSnap = await fetch(`${env.baseUrl}/api/admin/snapshot/my-repo`, {
+      method: 'PUT',
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN, 'x-sha': 'zz-top' },
+      body: createGzipBuffer('snap'),
+    });
+    assert.strictEqual(badShaSnap.status, 400);
+
+    const plainSnap = await fetch(`${env.baseUrl}/api/admin/snapshot/my-repo`, {
+      method: 'PUT',
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN, 'x-sha': HEX_SHA },
+      body: Buffer.from('this is not gzip'),
+    });
+    assert.strictEqual(plainSnap.status, 400);
+  } finally {
+    await env.close();
+  }
+});
+
+// Item 10: Cache-Control: private, no-store on authenticated responses
+test('Fix item 10: authenticated responses carry Cache-Control: private, no-store', async () => {
+  const env = await setupTestServer({ 'snapshots/my-repo.tar.gz': createGzipBuffer('seed') });
+  try {
+    const manifest = await fetch(`${env.baseUrl}/api/s/${MAC}/manifest`);
+    assert.strictEqual(manifest.headers.get('cache-control'), 'private, no-store');
+
+    const dl = await fetch(`${env.baseUrl}/api/s/${MAC}/dl/my-repo`);
+    assert.strictEqual(dl.headers.get('cache-control'), 'private, no-store');
+
+    const admin = await fetch(`${env.baseUrl}/api/admin/inbox`, {
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN },
+    });
+    assert.strictEqual(admin.headers.get('cache-control'), 'private, no-store');
+  } finally {
+    await env.close();
+  }
+});

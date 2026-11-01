@@ -44,7 +44,7 @@ test('Mint: produces a signed token that verifies and accesses agent routes', as
     const inboxRes = await fetch(`${env.baseUrl}/api/s/${mintedToken}/inbox/my-repo`, {
       method: 'POST',
       headers: {
-        'x-base-sha': 'base-sha-from-mint',
+        'x-base-sha': '0123456789abcdef0123456789abcdef01234567',
       },
       body: createGzipBuffer('minted agent work'),
     });

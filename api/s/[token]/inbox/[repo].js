@@ -1,7 +1,7 @@
 import { authenticateAgent } from '../../../../lib/auth.js';
 import { parseBody, sendJson, sendError, HttpError } from '../../../../lib/http.js';
-import { getBuffer, putBuffer } from '../../../../lib/store.js';
-import { isValidRepo, sanitizeFrom, formatTimestamp, MAX_BODY_SIZE } from '../../../../lib/validation.js';
+import { getEntry, putBuffer } from '../../../../lib/store.js';
+import { isValidRepo, sanitizeFrom, inboxBlobPath, isValidSha, MAX_BODY_SIZE } from '../../../../lib/validation.js';
 
 export const config = {
   api: {
@@ -39,11 +39,23 @@ export default async function handler(req, res) {
   if (!baseSha || typeof baseSha !== 'string' || !baseSha.trim()) {
     return sendError(res, 400, 'Missing x-base-sha header');
   }
+  if (!isValidSha(baseSha.trim())) {
+    return sendError(res, 400, 'Invalid x-base-sha header');
+  }
 
-  const rawFrom = req.headers['x-from'] || auth.name || auth.label;
-  const from = sanitizeFrom(rawFrom);
-  if (!from) {
+  // Item 4: Pin identity to the token (auth.name for long-lived, auth.label for signed)
+  const from = auth.name || auth.label;
+  if (!from || !sanitizeFrom(from)) {
     return sendError(res, 400, 'Invalid from identifier');
+  }
+
+  const rawFrom = req.headers['x-from'];
+  let fromClaimed;
+  if (rawFrom && typeof rawFrom === 'string' && rawFrom.trim()) {
+    const sanitizedClaimed = sanitizeFrom(rawFrom);
+    if (sanitizedClaimed && sanitizedClaimed !== from) {
+      fromClaimed = sanitizedClaimed;
+    }
   }
 
   let bodyBuffer;
@@ -56,48 +68,80 @@ export default async function handler(req, res) {
     return sendError(res, 500, 'Internal server error reading body');
   }
 
+  // Item 9: Check gzip magic bytes 0x1f 0x8b
+  if (bodyBuffer.length < 2 || bodyBuffer[0] !== 0x1f || bodyBuffer[1] !== 0x8b) {
+    return sendError(res, 400, 'Body is not gzip');
+  }
+
+  const blobPath = inboxBlobPath(from, repo);
+
   try {
-    const timestamp = formatTimestamp();
-    const blobPath = `inbox/${from}/${timestamp}-${repo}.tar.gz`;
     await putBuffer(blobPath, bodyBuffer, 'application/gzip');
 
-    // Read and update index.json (known read-modify-write race)
-    const indexBuf = await getBuffer('inbox/index.json');
-    let index = { seq: 0, entries: [] };
-    if (indexBuf) {
+    // Item 2: Read-modify-write race with optimistic concurrency control (ifMatch / retry up to 3 times)
+    let retries = 3;
+    let nextSeq = 1;
+
+    while (retries > 0) {
+      const entryResult = await getEntry('inbox/index.json');
+      let index = { seq: 0, entries: [] };
+      let currentEtag = undefined;
+
+      if (entryResult) {
+        currentEtag = entryResult.etag;
+        try {
+          index = JSON.parse(entryResult.buffer.toString('utf8'));
+        } catch {
+          index = { seq: 0, entries: [] };
+        }
+      }
+
+      if (!Array.isArray(index.entries)) {
+        index.entries = [];
+      }
+
+      nextSeq = (Number.isInteger(index.seq) ? index.seq : 0) + 1;
+      const entry = {
+        seq: nextSeq,
+        from,
+        repo,
+        base_sha: baseSha.trim(),
+        size_bytes: bodyBuffer.length,
+        path: blobPath,
+        received_at: new Date().toISOString(),
+      };
+      if (fromClaimed) {
+        entry.from_claimed = fromClaimed;
+      }
+
+      index.seq = nextSeq;
+      index.entries.push(entry);
+
       try {
-        index = JSON.parse(indexBuf.toString('utf8'));
-      } catch {
-        index = { seq: 0, entries: [] };
+        await putBuffer(
+          'inbox/index.json',
+          Buffer.from(JSON.stringify(index, null, 2)),
+          'application/json',
+          { ifMatch: currentEtag }
+        );
+        break; // Success!
+      } catch (err) {
+        if (err?.name === 'PreconditionFailed' || err?.name === 'BlobPreconditionFailedError') {
+          retries--;
+          if (retries === 0) {
+            return sendError(res, 500, 'Precondition failed after retries');
+          }
+          continue;
+        }
+        throw err;
       }
     }
 
-    if (!Array.isArray(index.entries)) {
-      index.entries = [];
-    }
-
-    const nextSeq = (Number.isInteger(index.seq) ? index.seq : 0) + 1;
-    const entry = {
-      seq: nextSeq,
-      from,
-      repo,
-      base_sha: baseSha.trim(),
-      size_bytes: bodyBuffer.length,
-      path: blobPath,
-      received_at: new Date().toISOString(),
-    };
-
-    index.seq = nextSeq;
-    index.entries.push(entry);
-
-    await putBuffer(
-      'inbox/index.json',
-      Buffer.from(JSON.stringify(index, null, 2)),
-      'application/json'
-    );
-
     return sendJson(res, 201, { ok: true, seq: nextSeq });
   } catch (err) {
+    if (err instanceof HttpError) {
+      return sendError(res, err.statusCode, err.message);
+    }
     return sendError(res, 500, 'Internal server error');
   }
 }

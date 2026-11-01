@@ -20,12 +20,28 @@ export default async function handler(req, res) {
     } catch {}
   }
 
-  if (!filePath || typeof filePath !== 'string' || !filePath.startsWith('inbox/')) {
+  if (!filePath || typeof filePath !== 'string') {
     return sendError(res, 400, 'Invalid path');
   }
 
-  // Prevent path traversal
-  if (filePath.includes('..') || filePath.includes('\\')) {
+  // Item 3: Strict traversal guard and shape check: inbox/<seg>/<file>.tar.gz (exactly 3 segments)
+  // Reject backslashes, NUL, any segment that is exactly '.' or '..'
+  if (filePath.includes('\\') || filePath.includes('\0')) {
+    return sendError(res, 400, 'Invalid path');
+  }
+
+  const parts = filePath.split('/');
+  if (parts.length !== 3 || parts[0] !== 'inbox') {
+    return sendError(res, 400, 'Invalid path');
+  }
+
+  for (const seg of parts) {
+    if (seg === '.' || seg === '..') {
+      return sendError(res, 400, 'Invalid path');
+    }
+  }
+
+  if (!parts[2].endsWith('.tar.gz')) {
     return sendError(res, 400, 'Invalid path');
   }
 
