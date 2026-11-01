@@ -57,34 +57,31 @@ All persistent state is stored in a single private Vercel Blob store (`@vercel/b
 
 All state is stored within private Vercel Blob keys:
 
-- `snapshots/<repo>.tar.gz` — The latest snapshot archive of a repository.
-- `meta/<repo>.json` — Metadata object for the snapshot:
+- `snapshots/<repo>@<sha>.tar.gz` — Snapshot archive bytes, versioned by the commit SHA they belong to. (Snapshots published before versioning live at the legacy path `snapshots/<repo>.tar.gz`; see the meta fallback below.)
+- `meta/<repo>.json` — Metadata object for the current snapshot; the meta write is the commit point of a publish:
   ```json
   {
     "repo": "<repo>",
     "sha": "<sha>",
     "size_bytes": 1048576,
-    "updated_at": "2026-11-01T08:00:00.000Z"
+    "updated_at": "2026-11-01T08:00:00.000Z",
+    "path": "snapshots/<repo>@<sha>.tar.gz"
   }
   ```
-- `inbox/index.json` — Inbox sequence index and entry history:
+  Downloads follow `meta.path`; a meta without `path` (pre-versioning) falls back to `snapshots/<repo>.tar.gz`.
+- `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz` — Individual submitted work products (with a random 8-character hex suffix to ensure unique paths even for concurrent uploads within the same second).
+- `inbox/<from>/<...>.tar.gz.json` — Sidecar metadata for one submission:
   ```json
   {
-    "seq": 12,
-    "entries": [
-      {
-        "seq": 1,
-        "from": "macmuse",
-        "repo": "cool-project",
-        "base_sha": "abc1234",
-        "size_bytes": 20480,
-        "path": "inbox/macmuse/20261101-120000-cool-project.tar.gz",
-        "received_at": "2026-11-01T12:00:00.000Z"
-      }
-    ]
+    "from": "macmuse",
+    "repo": "cool-project",
+    "base_sha": "abc1234",
+    "size_bytes": 20480,
+    "path": "inbox/macmuse/20261101-120000-cool-project-1a2b3c4d.tar.gz",
+    "received_at": "2026-11-01T12:00:00.000Z"
   }
   ```
-- `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz` — Individual submitted work products (with a random 8-character hex suffix to ensure unique paths even for concurrent uploads within the same second).
+- `inbox/index.json` — Legacy only: entries recorded by the retired shared-index design. Still read and merged into listings for compatibility; nothing writes it anymore.
 
 ### Identifiers & Limits
 - `<repo>`: Must match `^[a-z0-9][a-z0-9._-]*$` (strictly lowercase). Non-matching identifiers are rejected with `400`.
@@ -115,8 +112,8 @@ All state is stored within private Vercel Blob keys:
     - `x-base-sha` (required): Commit SHA the agent's work is based upon.
     - `x-from` (optional): Self-declared sender name, recorded in the index entry as `from_claimed` for information only. The stored `from` and the blob path always use the authenticated token identity (recipient token name or signed token label), never this header.
   - Body: Raw `tar.gz` archive (max 4.5 MB).
-  - Saves file to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz`, appends entry to `inbox/index.json`, increments `seq`.
-  - Returns `201 {"ok":true,"seq":N}`.
+  - Saves the payload to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz` and its metadata to a sidecar file at the same path plus `.json`. No shared state is modified.
+  - Returns `201 {"ok":true,"seq":N,"id":"<payload path>"}`. `id` is the durable receipt. `seq` is an advisory count of inbox entries at that moment — not a cursor (see the inbox section below).
 
 ### Admin Routes (`x-admin-token` header)
 - `PUT /api/admin/snapshot/<repo>`
@@ -126,11 +123,11 @@ All state is stored within private Vercel Blob keys:
   - Returns `200 {"ok":true,"repo":...,"sha":...,"size_bytes":N}`.
 - `GET /api/admin/inbox?since=<seq>`
   - Headers: `x-admin-token` (required).
-  - Query parameter `since` (optional integer): Returns only entries where `seq > since`.
-  - Returns `200 {"seq": <current>, "entries": [ ... ]}`.
+  - Returns `200 {"seq": <count>, "entries": [ ... ]}`. Every entry carries a stable `id` (its payload blob path), plus a `seq` that is only its ordinal within this response.
+  - Query parameter `since` (optional integer): Returns only entries whose response-local `seq > since`. Convenience only — a late-visible entry can sort into an already-seen range and be missed. Pollers that must not miss returns should fetch the full list and diff by `id` against their own seen set.
 - `GET /api/admin/inbox-file?path=<blob path>`
   - Headers: `x-admin-token` (required).
-  - Query parameter `path` (required, must start with `inbox/`).
+  - Query parameter `path` (required): must be exactly `inbox/<from>/<file>.tar.gz` (3 segments, `.tar.gz` payload). Sidecar `.json` files and the legacy index are not served here.
   - Returns `200` with the raw file bytes.
 - `POST /api/admin/mint`
   - Headers: `x-admin-token` (required).
@@ -146,6 +143,8 @@ A submission writes exactly two objects, both unique to itself:
 2. A sidecar metadata file at the same path plus `.json`.
 
 No shared mutable state is touched on write, so concurrent submissions cannot lose each other. The admin listing derives entries at read time: legacy entries recorded in the old shared `inbox/index.json` (kept read-only for compatibility) come first with their stored seq values, then sidecar entries ordered by `received_at` with seq continuing after them.
+
+Identity vs. ordering: an entry's durable identity is its `id` (the payload path) — unique and immutable. The `seq` in a listing is just the entry's position in that response; because a store write can become visible late, a newcomer can legitimately sort ahead of entries a poller has already seen, renumbering them. Any consumer polling for new returns must therefore track seen `id`s, not a seq high-water mark.
 
 History: the inbox originally kept a single `inbox/index.json` updated by read-modify-write. A later round added ETag/`ifMatch` optimistic concurrency, which still lost entries against the real store — the ETag and the body come from separate reads of an eventually consistent store and can belong to different versions, and the download-path ETag does not satisfy put preconditions. The sidecar design removes the shared file instead of layering more retries on it. The storage adapter still exposes `getEntry`/`ifMatch` for any future use that can tolerate those semantics.
 

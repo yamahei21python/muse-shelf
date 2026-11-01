@@ -1,7 +1,7 @@
 import { authenticateAgent } from '../../../../lib/auth.js';
 import { parseBody, sendJson, sendError, HttpError } from '../../../../lib/http.js';
 import { putBuffer } from '../../../../lib/store.js';
-import { listInboxEntries } from '../../../../lib/inbox.js';
+import { countInboxEntries } from '../../../../lib/inbox.js';
 import { isValidRepo, sanitizeFrom, inboxBlobPath, isValidSha, MAX_BODY_SIZE } from '../../../../lib/validation.js';
 
 export const config = {
@@ -48,7 +48,8 @@ export default async function handler(req, res) {
   // The SANITISED form is what gets stored and used in blob paths: a raw
   // label like "Worker One/x" would otherwise produce a multi-segment
   // path that the strict inbox-file guard (item 3) can never return.
-  const from = sanitizeFrom(auth.name || auth.label || '');
+  // authenticateAgent() already resolved and validated the identity.
+  const from = auth.identity || sanitizeFrom(auth.name || auth.label || '');
   if (!from) {
     return sendError(res, 400, 'Invalid from identifier');
   }
@@ -106,17 +107,18 @@ export default async function handler(req, res) {
       'application/json'
     );
 
-    // seq is assigned at read time (see lib/inbox.js); the value in
-    // this response is the entry's position as of just after this
-    // write, on a best-effort basis.
+    // The durable receipt is `id` (the payload path). `seq` is an
+    // advisory count of entries as of just after this write; it is
+    // computed from a path listing only, never by fetching sidecar
+    // bodies, so posting stays cheap as the inbox grows.
     let seq = 0;
     try {
-      seq = (await listInboxEntries()).length;
+      seq = await countInboxEntries();
     } catch {
       seq = 0;
     }
 
-    return sendJson(res, 201, { ok: true, seq });
+    return sendJson(res, 201, { ok: true, seq, id: blobPath });
   } catch (err) {
     if (err instanceof HttpError) {
       return sendError(res, err.statusCode, err.message);

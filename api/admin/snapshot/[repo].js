@@ -55,16 +55,24 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. Store snapshot bytes
-    const snapshotPath = `snapshots/${repo}.tar.gz`;
+    // Versioned bytes + pointer meta. The bytes for a given SHA are
+    // written under their own path first; the meta write is the
+    // commit point. If the meta write fails, the previous meta still
+    // points at the previous complete bytes (the new bytes are an
+    // unreferenced orphan), so the manifest can never describe bytes
+    // that belong to a different SHA. The pre-versioning canonical
+    // path is no longer written; downloads fall back to it when a
+    // meta has no `path` (snapshots published before this change).
+    const shaTrimmed = sha.trim();
+    const snapshotPath = `snapshots/${repo}@${shaTrimmed}.tar.gz`;
     await putBuffer(snapshotPath, bodyBuffer, 'application/gzip');
 
-    // 2. Store meta
     const meta = {
       repo,
-      sha: sha.trim(),
+      sha: shaTrimmed,
       size_bytes: bodyBuffer.length,
       updated_at: new Date().toISOString(),
+      path: snapshotPath,
     };
     const metaPath = `meta/${repo}.json`;
     await putBuffer(

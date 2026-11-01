@@ -30,7 +30,21 @@ export default async function handler(req, res) {
   }
 
   try {
-    const blobPath = `snapshots/${repo}.tar.gz`;
+    // Snapshots are versioned: the meta points at the bytes for its
+    // SHA. Metas written before versioning have no `path`; fall back
+    // to the old canonical location.
+    let blobPath = `snapshots/${repo}.tar.gz`;
+    try {
+      const metaBuf = await getBuffer(`meta/${repo}.json`);
+      if (metaBuf) {
+        const meta = JSON.parse(metaBuf.toString('utf8'));
+        if (meta && typeof meta.path === 'string' && meta.path.startsWith('snapshots/')) {
+          blobPath = meta.path;
+        }
+      }
+    } catch {
+      // Unreadable meta: fall back to the canonical path.
+    }
     const snapshotBuffer = await getBuffer(blobPath);
     if (!snapshotBuffer) {
       return sendError(res, 404, 'Repository snapshot not found');

@@ -26,8 +26,9 @@ test('Snapshot PUT: stores snapshot bytes and writes meta JSON', async () => {
       size_bytes: snapshotBytes.length,
     });
 
-    // Verify snapshot file in store
-    const storedSnapshot = await env.memoryStore.getBuffer('snapshots/project-a.tar.gz');
+    // Verify snapshot file in store (versioned path, meta points at it)
+    const versionedPath = 'snapshots/project-a@0123456789abcdef0123456789abcdef01234567.tar.gz';
+    const storedSnapshot = await env.memoryStore.getBuffer(versionedPath);
     assert.deepStrictEqual(storedSnapshot, snapshotBytes);
 
     // Verify meta file in store
@@ -36,6 +37,7 @@ test('Snapshot PUT: stores snapshot bytes and writes meta JSON', async () => {
     const meta = JSON.parse(storedMetaBuf.toString('utf8'));
     assert.strictEqual(meta.repo, 'project-a');
     assert.strictEqual(meta.sha, '0123456789abcdef0123456789abcdef01234567');
+    assert.strictEqual(meta.path, versionedPath);
     assert.strictEqual(meta.size_bytes, snapshotBytes.length);
     assert.ok(meta.updated_at);
     assert.strictEqual(new Date(meta.updated_at).toISOString(), meta.updated_at);

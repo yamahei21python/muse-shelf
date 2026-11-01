@@ -8,7 +8,7 @@ and this file were completed by Muse during acceptance, after the
 delegated runs stalled / exited early twice. Suite size grew across
 rounds: 35 after round 1 (28 pre-existing + 7 new), 37 after the
 round-2 fixes, 39 after the sidecar redesign (parallel-posts and
-legacy-merge tests). All counts include test/helpers.js, which
+legacy-merge tests), 44 after round 3. All counts include test/helpers.js, which
 node --test tallies as one entry.
 
 ## Per item
@@ -109,10 +109,9 @@ both are fixed in this round, with regression tests.
   (lib/inbox.js). Verified live with four parallel posts — all four
   entries listed, where the previous designs lost entries even at
   two.
-  Residual: when `inbox/index.json` does not exist yet there is no
-  etag to match, so two simultaneous FIRST posts can still race.
-  Accepted (the shelf is created by an admin publish flow in
-  practice); noted here rather than papered over.
+  Residual (superseded by the final design above): with the shared
+  index gone from the write path there is nothing left to race;
+  the first-posts concern belonged to the etag design.
 - **Item 4 regression: unsanitised identity stored.** The handler
   validated `sanitizeFrom(from)` but stored and pathed the RAW
   `auth.name || auth.label`. A label such as `Worker One/x` produced
@@ -123,13 +122,54 @@ both are fixed in this round, with regression tests.
   with the label `Worker One/x`, posts, and downloads the return
   through inbox-file.
 
+## Round 3 (fresh external review of 35c63109)
+
+A from-scratch review of the public repo (its own run: 39/39) found
+one structural flaw in the sidecar design plus smaller items; each
+was verified locally before fixing:
+
+- Entry identity: seq is derived at read time, so a late-visible
+  sidecar can sort into an already-polled range and be missed by
+  `?since=` consumers while an older entry repeats. No scalar
+  cursor is safe over an eventually consistent set, so entries now
+  carry a stable `id` (the payload path), the POST response returns
+  it as the durable receipt, and seq is documented as a
+  response-local ordinal. The operator's notification hook was
+  migrated to seen-id diffing.
+- Posting cost: the POST handler called the full listing (fetching
+  every sidecar body, sequentially) just to count entries. It now
+  uses countInboxEntries() (one list call + the legacy index read).
+  Regression test asserts zero sidecar body reads during a POST.
+- Snapshot consistency: snapshot bytes are versioned
+  (`snapshots/<repo>@<sha>.tar.gz`) and the meta — which now records
+  `path` — is the commit point. A failed meta write leaves the
+  previous version fully intact (the new bytes are an unreferenced
+  orphan). Downloads follow meta.path with a fallback to the legacy
+  canonical path for pre-versioning snapshots. Regression test
+  injects a meta write failure and checks manifest + download still
+  serve the previous version.
+- Router: query values from URLSearchParams were decoded a second
+  time, corrupting or rejecting legitimate values (`%25nothex`
+  became a false 400). They are now used as decoded once by the URL
+  parser; path segments are still decoded exactly once.
+- Token identity config: a long-lived token whose configured name
+  cannot sanitise to a shelf identity now fails fast (500, server
+  configuration) on every route instead of authenticating for reads
+  but failing only at inbox POST time.
+- safeEqual compares SHA-256 digests, so comparison time no longer
+  depends on the secret's length.
+- README: storage layout, POST and admin-inbox contracts, and the
+  inbox-file restriction now match the implementation (the front
+  half still described the retired index design).
+
+Suite after round 3: 44 tests (39 + 5 new), passing on Node 22/24.
+
 ## Deviations / notes
 
-- Item 2's handler-level concurrency is covered by an adapter-level
-  test plus the sequential two-post happy path; a true concurrent
-  two-request race is not simulated (the in-memory adapter resolves
-  synchronously per request, so interleaving cannot be forced
-  deterministically). The retry loop is code-reviewed.
+- (Historical, rounds 1–2) Handler-level concurrency was initially
+  covered only by adapter-level tests; the sidecar redesign made
+  the write path contention-free by construction, and a handler
+  level parallel-posts test (4 concurrent submissions, all listed)
+  was added with it in round 2.
 - `npm test` counts test/helpers.js as one "test" file entry under
-  node --test; the 35 total includes it (the pre-existing 28 did too,
-  so the net new real tests are 7).
+  node --test; every total quoted in this file includes it.

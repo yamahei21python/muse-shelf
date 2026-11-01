@@ -321,3 +321,140 @@ test('Fix item 10: authenticated responses carry Cache-Control: private, no-stor
     await env.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Round 3 (fresh-review fixes): stable entry identity, cheap posting,
+// snapshot write consistency, query decoding, identity config checks.
+// ---------------------------------------------------------------------------
+
+const SHA_B = 'fedcba9876543210fedcba9876543210fedcba98';
+
+test('Round 3: entries carry a stable id (the payload path); POST returns it', async () => {
+  const env = await setupTestServer();
+  try {
+    const post = await fetch(`${env.baseUrl}/api/s/${MAC}/inbox/my-repo`, {
+      method: 'POST',
+      headers: { 'x-base-sha': HEX_SHA },
+      body: createGzipBuffer('round3 work'),
+    });
+    assert.strictEqual(post.status, 201);
+    const data = await post.json();
+    assert.ok(typeof data.id === 'string' && data.id.endsWith('.tar.gz'));
+    assert.ok(data.id.startsWith('inbox/macmuse/'));
+
+    const listRes = await fetch(`${env.baseUrl}/api/admin/inbox`, {
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN },
+    });
+    const list = await listRes.json();
+    assert.strictEqual(list.entries.length, 1);
+    assert.strictEqual(list.entries[0].id, data.id);
+    assert.strictEqual(list.entries[0].id, list.entries[0].path);
+  } finally {
+    await env.close();
+  }
+});
+
+test('Round 3: POST does not fetch sidecar bodies to compute its response', async () => {
+  const seed = {};
+  for (let i = 0; i < 3; i++) {
+    const p = `inbox/macmuse/20260101-00000${i}-my-repo-0000000${i}.tar.gz`;
+    seed[`${p}.json`] = JSON.stringify({
+      from: 'macmuse', repo: 'my-repo', base_sha: HEX_SHA, size_bytes: 1,
+      path: p, received_at: `2026-01-01T00:00:0${i}.000Z`,
+    });
+  }
+  const env = await setupTestServer(seed);
+  try {
+    let sidecarReads = 0;
+    const orig = env.memoryStore.getBuffer.bind(env.memoryStore);
+    env.memoryStore.getBuffer = async (p) => {
+      if (p.endsWith('.tar.gz.json')) sidecarReads++;
+      return orig(p);
+    };
+    const post = await fetch(`${env.baseUrl}/api/s/${MAC}/inbox/my-repo`, {
+      method: 'POST',
+      headers: { 'x-base-sha': HEX_SHA },
+      body: createGzipBuffer('cheap post'),
+    });
+    assert.strictEqual(post.status, 201);
+    const data = await post.json();
+    assert.strictEqual(data.seq, 4);
+    assert.strictEqual(sidecarReads, 0);
+  } finally {
+    await env.close();
+  }
+});
+
+test('Round 3: a failed snapshot meta write leaves the previous version intact', async () => {
+  const env = await setupTestServer();
+  const bytesA = createGzipBuffer('version A');
+  const bytesB = createGzipBuffer('version B');
+  const put = (sha, body) => fetch(`${env.baseUrl}/api/admin/snapshot/proj`, {
+    method: 'PUT',
+    headers: { 'x-admin-token': TEST_ADMIN_TOKEN, 'x-sha': sha },
+    body,
+  });
+  try {
+    assert.strictEqual((await put(HEX_SHA, bytesA)).status, 200);
+
+    const orig = env.memoryStore.putBuffer.bind(env.memoryStore);
+    env.memoryStore.putBuffer = async (p, b, ct, opts) => {
+      if (p.startsWith('meta/')) throw new Error('simulated meta write failure');
+      return orig(p, b, ct, opts);
+    };
+    assert.strictEqual((await put(SHA_B, bytesB)).status, 500);
+    env.memoryStore.putBuffer = orig;
+
+    // Manifest still describes A, and downloads still return A's bytes.
+    const man = await (await fetch(`${env.baseUrl}/api/s/${MAC}/manifest`)).json();
+    assert.strictEqual(man.repos.length, 1);
+    assert.strictEqual(man.repos[0].sha, HEX_SHA);
+    const dlA = await fetch(`${env.baseUrl}/api/s/${MAC}/dl/proj`);
+    assert.deepStrictEqual(Buffer.from(await dlA.arrayBuffer()), bytesA);
+
+    // A healthy retry publishes B completely.
+    assert.strictEqual((await put(SHA_B, bytesB)).status, 200);
+    const dlB = await fetch(`${env.baseUrl}/api/s/${MAC}/dl/proj`);
+    assert.deepStrictEqual(Buffer.from(await dlB.arrayBuffer()), bytesB);
+  } finally {
+    await env.close();
+  }
+});
+
+test('Round 3: query values are decoded exactly once', async () => {
+  const env = await setupTestServer();
+  try {
+    // "%25nothex" is a valid encoding of the literal "%nothex"; the
+    // old double decode turned it into a URIError and a false 400.
+    const res = await fetch(`${env.baseUrl}/api/admin/inbox?since=0&extra=%25nothex`, {
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN },
+    });
+    assert.strictEqual(res.status, 200);
+
+    // A double-encoded path must NOT be decoded twice into a valid one.
+    const dbl = await fetch(
+      `${env.baseUrl}/api/admin/inbox-file?path=${encodeURIComponent('inbox%2Fmacmuse%2Fwhatever.tar.gz')}`,
+      { headers: { 'x-admin-token': TEST_ADMIN_TOKEN } }
+    );
+    assert.strictEqual(dbl.status, 400);
+  } finally {
+    await env.close();
+  }
+});
+
+test('Round 3: an unusable long-lived token name fails fast on every route', async () => {
+  const env = await setupTestServer();
+  try {
+    process.env.SHELF_TOKENS_JSON = JSON.stringify({ 'テスト': 'bad-name-token' });
+    const man = await fetch(`${env.baseUrl}/api/s/bad-name-token/manifest`);
+    assert.strictEqual(man.status, 500);
+    const post = await fetch(`${env.baseUrl}/api/s/bad-name-token/inbox/my-repo`, {
+      method: 'POST',
+      headers: { 'x-base-sha': HEX_SHA },
+      body: createGzipBuffer('x'),
+    });
+    assert.strictEqual(post.status, 500);
+  } finally {
+    await env.close();
+  }
+});
