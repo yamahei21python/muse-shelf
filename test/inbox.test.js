@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { setupTestServer, TEST_RECIPIENT_TOKENS, createGzipBuffer } from './helpers.js';
+import { setupTestServer, TEST_RECIPIENT_TOKENS, TEST_ADMIN_TOKEN, createGzipBuffer } from './helpers.js';
 import { MAX_BODY_SIZE } from '../lib/validation.js';
 
 test('Inbox POST: appends entry, increments seq, and stores blob', async () => {
@@ -42,10 +42,12 @@ test('Inbox POST: appends entry, increments seq, and stores blob', async () => {
     assert.strictEqual(data2.ok, true);
     assert.strictEqual(data2.seq, 2);
 
-    // Verify index.json content
-    const indexBuf = await env.memoryStore.getBuffer('inbox/index.json');
-    assert.ok(indexBuf);
-    const index = JSON.parse(indexBuf.toString('utf8'));
+    // Verify the listing (entries are sidecar files; seq is read-time)
+    const listRes = await fetch(`${env.baseUrl}/api/admin/inbox`, {
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN },
+    });
+    assert.strictEqual(listRes.status, 200);
+    const index = await listRes.json();
     assert.strictEqual(index.seq, 2);
     assert.strictEqual(index.entries.length, 2);
 

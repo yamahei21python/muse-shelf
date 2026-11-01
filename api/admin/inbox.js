@@ -1,6 +1,6 @@
 import { authenticateAdmin } from '../../lib/auth.js';
 import { sendJson, sendError } from '../../lib/http.js';
-import { getBuffer } from '../../lib/store.js';
+import { listInboxEntries } from '../../lib/inbox.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -32,18 +32,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    const indexBuf = await getBuffer('inbox/index.json');
-    let index = { seq: 0, entries: [] };
-    if (indexBuf) {
-      try {
-        index = JSON.parse(indexBuf.toString('utf8'));
-      } catch {
-        index = { seq: 0, entries: [] };
-      }
-    }
-
-    const currentSeq = Number.isInteger(index.seq) ? index.seq : 0;
-    const allEntries = Array.isArray(index.entries) ? index.entries : [];
+    const allEntries = await listInboxEntries();
+    const currentSeq = allEntries.length ? allEntries[allEntries.length - 1].seq : 0;
     const entries = filterSince !== null
       ? allEntries.filter((e) => Number.isInteger(e.seq) && e.seq > filterSince)
       : allEntries;

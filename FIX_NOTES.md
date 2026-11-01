@@ -5,9 +5,11 @@ Fixes driven by two independent reviews of the initial release
 changes were drafted by a delegated opencode run; fixture updates,
 the regression tests in test/fixes.test.js, the README corrections
 and this file were completed by Muse during acceptance, after the
-delegated runs stalled / exited early twice. Final state verified by
-Muse: full suite 35/35 pass (28 pre-existing + 7 new), including the
-updated behaviour contracts below.
+delegated runs stalled / exited early twice. Suite size grew across
+rounds: 35 after round 1 (28 pre-existing + 7 new), 37 after the
+round-2 fixes, 39 after the sidecar redesign (parallel-posts and
+legacy-merge tests). All counts include test/helpers.js, which
+node --test tallies as one entry.
 
 ## Per item
 
@@ -18,10 +20,11 @@ updated behaviour contracts below.
    the updated inbox happy-path test.
 2. **Index race** — storage adapters gained `getEntry()` (buffer +
    etag) and `putBuffer(..., { ifMatch })` throwing
-   `PreconditionFailed` (memory) / `BlobPreconditionFailedError`
-   (Vercel). The inbox handler retries the read-append-write cycle up
-   to 3 times, then returns 500. Adapter-level test in
-   test/fixes.test.js.
+   `PreconditionFailed`. The handler initially used them to retry the
+   read-append-write cycle; round 2 (below) showed that approach
+   still loses entries against the real store and replaced the
+   shared index with per-return sidecar files. The adapter capability
+   remains and is unit-tested; the handler no longer depends on it.
 3. **inbox-file ".." over-block** — the guard now requires the strict
    shape `inbox/<seg>/<file>.tar.gz` (exactly 3 segments), rejects
    segments equal to `.`/`..`, backslashes and NUL, and no longer
@@ -70,6 +73,55 @@ The section now describes the random-suffix paths and the etag
 protocol; the `x-from` description, the "all errors are JSON"
 qualification, a token-in-URL logging note and an untrusted-inbox
 warning were also added per FIX_SPEC.
+
+## Round 2 (post-release re-review)
+
+Two further defects were found by an external re-review of e7fd6835;
+both are fixed in this round, with regression tests.
+
+- **Item 2 was inert in production.** The Vercel adapter's getEntry
+  read `result.etag`, but @vercel/blob 2.8.2's `get()` returns
+  `{ statusCode, stream, headers, blob: { ..., etag } }` — the etag
+  lives on `blob` (verified against the installed SDK's type
+  definitions). Production therefore always saw etag undefined,
+  never sent ifMatch, and kept the original race. The memory adapter
+  returned the etag at the top level of its own result, mirroring
+  the misreading, so the suite could not catch it; the sequential
+  production smoke could not either. Fix: a pure helper
+  `etagFromGetResult()` (blob.etag, ETag-header fallback), unit
+  tested against the SDK's documented shape. Two deeper production
+  findings followed on the first live attempt: (1) the download-path
+  etag still never satisfies put's precondition (a quiescent
+  sequential write failed with "ETag mismatch"), so getEntry now
+  takes the etag from `head()` (metadata API) and only falls back to
+  the get() value; (2) the SDK's precondition error surfaces at
+  runtime with name 'Error', not 'BlobPreconditionFailedError', so
+  the Vercel adapter normalises it to the adapter contract
+  (name 'PreconditionFailed', matched on the message) and the
+  handler accepts that name. Even then, parallel live posts still
+  lost entries: with head() providing the etag and get() the body,
+  the two reads can return different versions of the index
+  (propagation skew), so a conditional write can succeed while
+  carrying a stale body. Final design: the shared index is gone
+  from the write path. Each return writes its payload plus a
+  sidecar `<path>.json`; the admin listing merges legacy
+  `inbox/index.json` entries (read-only) with sidecars at read time
+  (lib/inbox.js). Verified live with four parallel posts — all four
+  entries listed, where the previous designs lost entries even at
+  two.
+  Residual: when `inbox/index.json` does not exist yet there is no
+  etag to match, so two simultaneous FIRST posts can still race.
+  Accepted (the shelf is created by an admin publish flow in
+  practice); noted here rather than papered over.
+- **Item 4 regression: unsanitised identity stored.** The handler
+  validated `sanitizeFrom(from)` but stored and pathed the RAW
+  `auth.name || auth.label`. A label such as `Worker One/x` produced
+  `inbox/Worker One/x/...` — a 4-segment path the strict item-3
+  guard then refuses to return, and long-token names with spaces or
+  capitals were affected the same way. Fix: `from` is the sanitised
+  value (`sanitizeFrom(...)` or 400). Regression test mints a token
+  with the label `Worker One/x`, posts, and downloads the return
+  through inbox-file.
 
 ## Deviations / notes
 

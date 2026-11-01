@@ -139,19 +139,15 @@ All state is stored within private Vercel Blob keys:
 
 ---
 
-## The Read-Modify-Write Race on Inbox Index
+## How the Inbox Avoids the Read-Modify-Write Race
 
-### Explanation
-When an agent submits work to `POST /api/s/<token>/inbox/<repo>`, the server:
-1. Uploads the blob to `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz`.
-2. Reads `inbox/index.json` (with its ETag) from Vercel Blob store.
-3. Increments `index.seq` and appends the new entry record to `index.entries`.
-4. Writes `inbox/index.json` back conditionally with `ifMatch` set to the ETag it read. If the precondition fails (a concurrent submit won the race), it re-reads and retries, up to 3 attempts, before returning `500`.
+A submission writes exactly two objects, both unique to itself:
+1. The payload at `inbox/<from>/<yyyymmdd-hhmmss>-<repo>-<rand>.tar.gz` (random 8-hex suffix, so same-second submissions never collide).
+2. A sidecar metadata file at the same path plus `.json`.
 
-### Operational Scope & Mitigations
-- Blob paths are unique per upload: the file name carries a random 8-hex-character suffix, so two submissions in the same second — even from the same agent for the same repo — never overwrite each other, and every index entry points at its own bytes.
-- The index append uses optimistic concurrency (ETag + `ifMatch` + bounded retry), so concurrent submissions no longer silently drop each other's entries in the common case. A submission that still collides after all retries fails loudly with `500` instead of losing data silently.
-- Distribution is meant for a small set of trusted, asynchronous AI agents submitting infrequent completed tasks, so contention is rare to begin with.
+No shared mutable state is touched on write, so concurrent submissions cannot lose each other. The admin listing derives entries at read time: legacy entries recorded in the old shared `inbox/index.json` (kept read-only for compatibility) come first with their stored seq values, then sidecar entries ordered by `received_at` with seq continuing after them.
+
+History: the inbox originally kept a single `inbox/index.json` updated by read-modify-write. A later round added ETag/`ifMatch` optimistic concurrency, which still lost entries against the real store — the ETag and the body come from separate reads of an eventually consistent store and can belong to different versions, and the download-path ETag does not satisfy put preconditions. The sidecar design removes the shared file instead of layering more retries on it. The storage adapter still exposes `getEntry`/`ifMatch` for any future use that can tolerate those semantics.
 
 ---
 

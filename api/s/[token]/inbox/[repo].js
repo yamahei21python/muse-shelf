@@ -1,6 +1,7 @@
 import { authenticateAgent } from '../../../../lib/auth.js';
 import { parseBody, sendJson, sendError, HttpError } from '../../../../lib/http.js';
-import { getEntry, putBuffer } from '../../../../lib/store.js';
+import { putBuffer } from '../../../../lib/store.js';
+import { listInboxEntries } from '../../../../lib/inbox.js';
 import { isValidRepo, sanitizeFrom, inboxBlobPath, isValidSha, MAX_BODY_SIZE } from '../../../../lib/validation.js';
 
 export const config = {
@@ -43,9 +44,12 @@ export default async function handler(req, res) {
     return sendError(res, 400, 'Invalid x-base-sha header');
   }
 
-  // Item 4: Pin identity to the token (auth.name for long-lived, auth.label for signed)
-  const from = auth.name || auth.label;
-  if (!from || !sanitizeFrom(from)) {
+  // Item 4: Pin identity to the token (auth.name for long-lived, auth.label for signed).
+  // The SANITISED form is what gets stored and used in blob paths: a raw
+  // label like "Worker One/x" would otherwise produce a multi-segment
+  // path that the strict inbox-file guard (item 3) can never return.
+  const from = sanitizeFrom(auth.name || auth.label || '');
+  if (!from) {
     return sendError(res, 400, 'Invalid from identifier');
   }
 
@@ -78,66 +82,41 @@ export default async function handler(req, res) {
   try {
     await putBuffer(blobPath, bodyBuffer, 'application/gzip');
 
-    // Item 2: Read-modify-write race with optimistic concurrency control (ifMatch / retry up to 3 times)
-    let retries = 3;
-    let nextSeq = 1;
+    // Item 2 (final design): the entry is a sidecar JSON written next
+    // to the payload. No shared mutable state is touched, so
+    // concurrent submissions cannot lose each other. (The previous
+    // read-modify-write of inbox/index.json, even with etag/ifMatch
+    // optimistic concurrency, lost entries in production: the etag
+    // and the body come from separate reads against an eventually
+    // consistent store and can belong to different versions.)
+    const meta = {
+      from,
+      repo,
+      base_sha: baseSha.trim(),
+      size_bytes: bodyBuffer.length,
+      path: blobPath,
+      received_at: new Date().toISOString(),
+    };
+    if (fromClaimed) {
+      meta.from_claimed = fromClaimed;
+    }
+    await putBuffer(
+      `${blobPath}.json`,
+      Buffer.from(JSON.stringify(meta, null, 2)),
+      'application/json'
+    );
 
-    while (retries > 0) {
-      const entryResult = await getEntry('inbox/index.json');
-      let index = { seq: 0, entries: [] };
-      let currentEtag = undefined;
-
-      if (entryResult) {
-        currentEtag = entryResult.etag;
-        try {
-          index = JSON.parse(entryResult.buffer.toString('utf8'));
-        } catch {
-          index = { seq: 0, entries: [] };
-        }
-      }
-
-      if (!Array.isArray(index.entries)) {
-        index.entries = [];
-      }
-
-      nextSeq = (Number.isInteger(index.seq) ? index.seq : 0) + 1;
-      const entry = {
-        seq: nextSeq,
-        from,
-        repo,
-        base_sha: baseSha.trim(),
-        size_bytes: bodyBuffer.length,
-        path: blobPath,
-        received_at: new Date().toISOString(),
-      };
-      if (fromClaimed) {
-        entry.from_claimed = fromClaimed;
-      }
-
-      index.seq = nextSeq;
-      index.entries.push(entry);
-
-      try {
-        await putBuffer(
-          'inbox/index.json',
-          Buffer.from(JSON.stringify(index, null, 2)),
-          'application/json',
-          { ifMatch: currentEtag }
-        );
-        break; // Success!
-      } catch (err) {
-        if (err?.name === 'PreconditionFailed' || err?.name === 'BlobPreconditionFailedError') {
-          retries--;
-          if (retries === 0) {
-            return sendError(res, 500, 'Precondition failed after retries');
-          }
-          continue;
-        }
-        throw err;
-      }
+    // seq is assigned at read time (see lib/inbox.js); the value in
+    // this response is the entry's position as of just after this
+    // write, on a best-effort basis.
+    let seq = 0;
+    try {
+      seq = (await listInboxEntries()).length;
+    } catch {
+      seq = 0;
     }
 
-    return sendJson(res, 201, { ok: true, seq: nextSeq });
+    return sendJson(res, 201, { ok: true, seq });
   } catch (err) {
     if (err instanceof HttpError) {
       return sendError(res, err.statusCode, err.message);

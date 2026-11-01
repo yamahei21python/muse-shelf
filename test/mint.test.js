@@ -52,9 +52,11 @@ test('Mint: produces a signed token that verifies and accesses agent routes', as
     const inboxData = await inboxRes.json();
     assert.strictEqual(inboxData.ok, true);
 
-    // Verify index has from = 'agent-mint-test'
-    const indexBuf = await env.memoryStore.getBuffer('inbox/index.json');
-    const index = JSON.parse(indexBuf.toString('utf8'));
+    // Verify the listing has from = 'agent-mint-test'
+    const listRes = await fetch(`${env.baseUrl}/api/admin/inbox`, {
+      headers: { 'x-admin-token': TEST_ADMIN_TOKEN },
+    });
+    const index = await listRes.json();
     assert.strictEqual(index.entries[0].from, 'agent-mint-test');
   } finally {
     await env.close();
