@@ -33,9 +33,17 @@ updated behaviour contracts below.
    test was updated to the new contract (it previously asserted the
    spoofable behaviour).
 5. **Chunked oversize 413** — lib/http.js parseBody no longer calls
-   req.destroy() on limit breach; it pauses, drains in the background
-   and rejects with HttpError(413), so the client receives the JSON
-   error. Regression test uses a raw node:http chunked upload.
+   req.destroy() on limit breach. The first delegated draft paused,
+   drained in the background and rejected immediately; CI on Node 22
+   showed that still loses the response (answering mid-upload makes
+   Node destroy the socket; the client sees a reset and zero bytes —
+   reproduced with a raw TCP socket). Final behaviour: on breach the
+   reader keeps draining and discarding until the client finishes,
+   then rejects with HttpError(413), so the JSON error is delivered
+   on an intact socket. Regression test uses a raw TCP socket with a
+   hand-written chunked request (the node:http client masks this
+   server behaviour behind its own state machine, differently across
+   Node versions).
 6. **Malformed percent-encoding** — router decodes via a safeDecode
    wrapper; URIError becomes HttpError(400). Test included.
 7. **Router HttpError swallowing** — the router catch now preserves

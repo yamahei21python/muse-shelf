@@ -5,7 +5,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
+import net from 'node:net';
 import {
   setupTestServer,
   TEST_ADMIN_TOKEN,
@@ -65,44 +65,52 @@ test('Fix item 3: inbox-file allows a..b, rejects traversal shapes', async () =>
   }
 });
 
-// Item 5: chunked oversize upload receives a real 413 response
-test('Fix item 5: chunked oversize inbox POST returns 413 JSON, not a reset', async () => {
+// Item 5: chunked oversize upload receives a real 413 response.
+// Uses a raw TCP socket: the http client's request/response state
+// machine races with a mid-upload response differently across Node
+// versions (on Node 22 the client promise can be left pending when
+// the server answers and closes), which is a client artefact, not
+// the behaviour under test. The behaviour under test is purely
+// server-side: the 413 bytes must arrive before the socket closes.
+test('Fix item 5: chunked oversize inbox POST returns 413 JSON, not a reset', { timeout: 30000 }, async () => {
   const env = await setupTestServer();
   try {
-    const result = await new Promise((resolve, reject) => {
-      const req = http.request(
-        `${env.baseUrl}/api/s/${MAC}/inbox/my-repo`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/gzip',
-            'x-base-sha': HEX_SHA,
-            'transfer-encoding': 'chunked',
-          },
-        },
-        (res) => {
-          const chunks = [];
-          res.on('data', (c) => chunks.push(c));
-          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
-        }
-      );
-      req.on('error', reject);
-      const chunk = Buffer.alloc(64 * 1024, 0x61);
-      let sent = 0;
-      const total = MAX_BODY_SIZE + 256 * 1024;
-      (function pump() {
+    const raw = await new Promise((resolve) => {
+      const sock = net.connect(env.port, '127.0.0.1', async () => {
+        sock.write(
+          `POST /api/s/${MAC}/inbox/my-repo HTTP/1.1\r\n` +
+          'Host: 127.0.0.1\r\n' +
+          'Content-Type: application/gzip\r\n' +
+          `x-base-sha: ${HEX_SHA}\r\n` +
+          'Transfer-Encoding: chunked\r\n' +
+          'Connection: close\r\n\r\n'
+        );
+        const chunk = Buffer.alloc(128 * 1024, 0x61);
+        const frame = Buffer.concat([
+          Buffer.from(chunk.length.toString(16) + '\r\n'),
+          chunk,
+          Buffer.from('\r\n'),
+        ]);
+        let sent = 0;
+        const total = MAX_BODY_SIZE + 256 * 1024;
         while (sent < total) {
+          sock.write(frame);
           sent += chunk.length;
-          if (!req.write(chunk)) {
-            req.once('drain', pump);
-            return;
-          }
+          await new Promise((r) => setTimeout(r, 2));
         }
-        req.end();
-      })();
+        sock.write('0\r\n\r\n');
+      });
+      let buf = Buffer.alloc(0);
+      sock.on('data', (d) => { buf = Buffer.concat([buf, d]); });
+      sock.on('error', () => {});
+      sock.on('close', () => resolve(buf.toString('latin1')));
+      setTimeout(() => {
+        try { sock.destroy(); } catch { /* already closed */ }
+        resolve(buf.toString('latin1'));
+      }, 10000).unref();
     });
-    assert.strictEqual(result.status, 413);
-    assert.match(result.body, /"error"/);
+    assert.match(raw, /^HTTP\/1\.1 413/);
+    assert.match(raw, /"error"/);
   } finally {
     await env.close();
   }
