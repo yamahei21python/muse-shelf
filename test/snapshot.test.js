@@ -125,3 +125,74 @@ test('Snapshot PUT: rejects unauthenticated call with 401', async () => {
     await env.close();
   }
 });
+
+test('Snapshot PUT: stores created_by from x-created-by header (sanitised)', async () => {
+  const env = await setupTestServer();
+  try {
+    const snapshotBytes = createGzipBuffer('with creator');
+    const res = await fetch(`${env.baseUrl}/api/admin/snapshot/project-a`, {
+      method: 'PUT',
+      headers: {
+        'x-admin-token': TEST_ADMIN_TOKEN,
+        'x-sha': '0123456789abcdef0123456789abcdef01234567',
+        'x-created-by': 'MacMuse',
+        'content-type': 'application/gzip',
+      },
+      body: snapshotBytes,
+    });
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.created_by, 'macmuse');
+    const storedMetaBuf = await env.memoryStore.getBuffer('meta/project-a.json');
+    const meta = JSON.parse(storedMetaBuf.toString('utf8'));
+    assert.strictEqual(meta.created_by, 'macmuse');
+  } finally {
+    await env.close();
+  }
+});
+
+test('Snapshot PUT: rejects invalid x-created-by with 400', async () => {
+  const env = await setupTestServer();
+  try {
+    const snapshotBytes = createGzipBuffer('bad creator');
+    const res = await fetch(`${env.baseUrl}/api/admin/snapshot/project-a`, {
+      method: 'PUT',
+      headers: {
+        'x-admin-token': TEST_ADMIN_TOKEN,
+        'x-sha': 'abc1234',
+        'x-created-by': '!!!',
+        'content-type': 'application/gzip',
+      },
+      body: snapshotBytes,
+    });
+    assert.strictEqual(res.status, 400);
+    const data = await res.json();
+    assert.strictEqual(data.error, 'Invalid x-created-by header');
+  } finally {
+    await env.close();
+  }
+});
+
+test('Snapshot PUT: without x-created-by, meta has no created_by (legacy)', async () => {
+  const env = await setupTestServer();
+  try {
+    const snapshotBytes = createGzipBuffer('no creator');
+    const res = await fetch(`${env.baseUrl}/api/admin/snapshot/project-a`, {
+      method: 'PUT',
+      headers: {
+        'x-admin-token': TEST_ADMIN_TOKEN,
+        'x-sha': 'abc1234',
+        'content-type': 'application/gzip',
+      },
+      body: snapshotBytes,
+    });
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.ok(!('created_by' in data));
+    const storedMetaBuf = await env.memoryStore.getBuffer('meta/project-a.json');
+    const meta = JSON.parse(storedMetaBuf.toString('utf8'));
+    assert.ok(!('created_by' in meta));
+  } finally {
+    await env.close();
+  }
+});

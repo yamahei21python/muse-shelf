@@ -1,7 +1,7 @@
 import { authenticateAdmin } from '../../../lib/auth.js';
 import { parseBody, sendJson, sendError, HttpError } from '../../../lib/http.js';
 import { putBuffer } from '../../../lib/store.js';
-import { isValidRepo, isValidSha, MAX_BODY_SIZE } from '../../../lib/validation.js';
+import { isValidRepo, isValidSha, MAX_BODY_SIZE, sanitizeFrom } from '../../../lib/validation.js';
 
 export const config = {
   api: {
@@ -39,6 +39,18 @@ export default async function handler(req, res) {
     return sendError(res, 400, 'Invalid x-sha header');
   }
 
+  // Optional creator attribution (2026-11-03): x-created-by is stored
+  // in the snapshot meta as created_by, sanitised like inbox `from`
+  // identities. Absent header keeps legacy behaviour (no field).
+  let createdBy = null;
+  const createdByHeader = req.headers['x-created-by'];
+  if (createdByHeader !== undefined) {
+    createdBy = sanitizeFrom(createdByHeader);
+    if (!createdBy) {
+      return sendError(res, 400, 'Invalid x-created-by header');
+    }
+  }
+
   let bodyBuffer;
   try {
     bodyBuffer = await parseBody(req, MAX_BODY_SIZE);
@@ -74,6 +86,9 @@ export default async function handler(req, res) {
       updated_at: new Date().toISOString(),
       path: snapshotPath,
     };
+    if (createdBy) {
+      meta.created_by = createdBy;
+    }
     const metaPath = `meta/${repo}.json`;
     await putBuffer(
       metaPath,
@@ -86,6 +101,7 @@ export default async function handler(req, res) {
       repo,
       sha: sha.trim(),
       size_bytes: bodyBuffer.length,
+      ...(createdBy ? { created_by: createdBy } : {}),
     });
   } catch (err) {
     return sendError(res, 500, 'Internal server error');
