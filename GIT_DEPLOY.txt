@@ -1,0 +1,2 @@
+GitHub 接続後の初回自動デプロイ確認用マーカー。
+first git-triggered deploy: 2026-11-03
